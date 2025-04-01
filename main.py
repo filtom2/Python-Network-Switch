@@ -24,6 +24,10 @@ stats_lock = threading.Lock()  # Allows only one thread access
 duplicate_table = set()
 duplicate_table_lock = threading.Lock()
 
+# MAC table for forwarding: maps MAC addresses to interface names.
+mac_table = {}
+mac_table_lock = threading.Lock()
+
 def update_protocol_counters(packet, port_name, direction):
     # Ethernet II
     if packet.haslayer(Ether):
@@ -73,28 +77,50 @@ def process_packet(packet, in_port):
         else:
             duplicate_table.add(packet_hash)
 
+    # Learn the source MAC address.
+    src_mac = packet[Ether].src
+    dst_mac = packet[Ether].dst
+    with mac_table_lock:
+        mac_table[src_mac] = in_port
+
+    # Update statistics for incoming packet.
+    port_label_in = "port1" if in_port == PORT1 else "port2"
     with stats_lock:
-        # Determine which port to increment in stats.
-        port_label_in = "port1" if in_port == PORT1 else "port2"
         update_protocol_counters(packet, port_label_in, "in")
 
-    out_port = PORT2 if in_port == PORT1 else PORT1
-    port_label_out = "port1" if out_port == PORT1 else "port2"
+    # Determine output port(s) based on MAC table lookup.
+    out_ports = []
+    # Check for broadcast destination.
+    if dst_mac.lower() == "ff:ff:ff:ff:ff:ff":
+        out_ports = [port for port in [PORT1, PORT2] if port != in_port]
+    else:
+        with mac_table_lock:
+            if dst_mac in mac_table:
+                learned_port = mac_table[dst_mac]
+                # If the destination is learned on a different port, forward it.
+                if learned_port != in_port:
+                    out_ports = [learned_port]
+                # If the destination is on the same port, do not forward.
+                else:
+                    out_ports = []
+            else:
+                # Unknown destination: flood the packet to all ports except the ingress.
+                out_ports = [port for port in [PORT1, PORT2] if port != in_port]
 
-    # Forward the packet.
-    sendp(packet, iface=out_port, verbose=False)
-
-    # Update outgoing statistics.
-    with stats_lock:
-        update_protocol_counters(packet, port_label_out, "out")
+    # Forward the packet on each determined output port.
+    for port in out_ports:
+        sendp(packet, iface=port, verbose=False)
+        port_label_out = "port1" if port == PORT1 else "port2"
+        with stats_lock:
+            update_protocol_counters(packet, port_label_out, "out")
 
 def cleanup_duplicate_table():
     while True:
-        time.sleep(30) # timer for clear()
+        time.sleep(30)  # timer for clear()
         with duplicate_table_lock:
             duplicate_table.clear()
 
-#promisc = true
+# Enable promiscuous mode on the interface.
 def sniff_port(port):
     sniff(iface=port, prn=lambda pkt: process_packet(pkt, port), store=False, promisc=True)
 
@@ -104,14 +130,27 @@ class SwitchGUI(tk.Frame):
         self.pack(padx=10, pady=10)
         self.create_widgets()
         self.update_stats_display()
+        self.update_mac_table_display()
 
     def create_widgets(self):
-        self.stats_text = tk.Text(self, width=60, height=16)
+        # Create two frames side by side for stats and MAC table.
+        self.stats_frame = tk.Frame(self)
+        self.stats_frame.grid(row=0, column=0, padx=10, pady=10)
+        
+        self.mac_table_frame = tk.Frame(self)
+        self.mac_table_frame.grid(row=0, column=1, padx=10, pady=10)
+        
+        # Statistics widget.
+        self.stats_text = tk.Text(self.stats_frame, width=60, height=16)
         self.stats_text.pack()
-
-        # Reset button
-        self.reset_button = tk.Button(self, text="Reset Statistics", command=self.reset_stats)
+        self.reset_button = tk.Button(self.stats_frame, text="Reset Statistics", command=self.reset_stats)
         self.reset_button.pack(pady=5)
+        
+        # MAC Table widget.
+        self.mac_table_text = tk.Text(self.mac_table_frame, width=40, height=16)
+        self.mac_table_text.pack()
+        self.clear_mac_button = tk.Button(self.mac_table_frame, text="Clear MAC Table", command=self.clear_mac_table)
+        self.clear_mac_button.pack(pady=5)
 
     def update_stats_display(self):
         current_scroll = self.stats_text.yview()
@@ -150,6 +189,15 @@ class SwitchGUI(tk.Frame):
         self.stats_text.yview_moveto(current_scroll[0])
         self.after(500, self.update_stats_display)  # Refresh every 500 ms
 
+    def update_mac_table_display(self):
+        mac_display = "Learned MAC Addresses:\n\n"
+        with mac_table_lock:
+            for mac, port in mac_table.items():
+                mac_display += f"{mac} : {port}\n"
+        self.mac_table_text.delete("1.0", tk.END)
+        self.mac_table_text.insert(tk.END, mac_display)
+        self.after(500, self.update_mac_table_display)
+
     def reset_stats(self):
         with stats_lock:
             for direction in ("in", "out"):
@@ -157,6 +205,10 @@ class SwitchGUI(tk.Frame):
                     stats["port1"][direction][protocol] = 0
                 for protocol in stats["port2"][direction]:
                     stats["port2"][direction][protocol] = 0
+
+    def clear_mac_table(self):
+        with mac_table_lock:
+            mac_table.clear()
 
 def main():
     # Start sniffing on both ports.
@@ -170,7 +222,7 @@ def main():
     cleanup_thread.start()
 
     root = tk.Tk()
-    root.title("Statistics")
+    root.title("Switch Statistics and MAC Table")
     app = SwitchGUI(master=root)
     root.mainloop()
 
