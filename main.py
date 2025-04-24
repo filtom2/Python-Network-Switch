@@ -8,13 +8,16 @@ from scapy.all import sniff, sendp, Ether, ARP, IP, TCP, UDP, ICMP
 SYSLOG_SERVER_IP = "172.16.0.3"
 SYSLOG_SOURCE_IP = "172.16.0.10"
 SYSLOG_ENABLED   = False
+_SEVERITY = {"info": 6, "warning": 4, "critical": 2}
+_FACILITY = 23
 
 def send_syslog(msg, sev="info"):
     if not SYSLOG_ENABLED:
         return
+    pri = _FACILITY * 8 + _SEVERITY.get(sev, 6)
     ts = time.strftime("%b %d %H:%M:%S", time.localtime())
     host = socket.gethostname()
-    payload = f"{ts} {host} {sev.upper()}: {msg}"
+    payload = f"<{pri}>{ts} {host} {msg}"
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.bind((SYSLOG_SOURCE_IP, 0))
