@@ -3,14 +3,11 @@ import threading
 import time
 from scapy.all import sniff, sendp, Ether, ARP, IP, TCP, UDP, ICMP
 
-
-# Consider hashing only the header fields relevant for duplicate detection (e.g., source/destination MAC, IP, ports, and sequence numbers) rather than the entire packet. 
-# Reduce false negatives caused by minor changes in other fields (like TTL).
-
 # Select interface
 PORT1 = "en8"
 PORT2 = "en9"
 
+# Global statistics
 stats = {
     "port1": {
         "in": {"Ethernet": 0, "ARP": 0, "IP": 0, "TCP": 0, "UDP": 0, "ICMP": 0, "HTTP": 0},
@@ -27,13 +24,20 @@ stats_lock = threading.Lock()
 duplicate_table = set()
 duplicate_table_lock = threading.Lock()
 
-# MAC table now stores a dict: key = MAC, value = {"port": in_port, "timestamp": last_seen}
 mac_table = {}
 mac_table_lock = threading.Lock()
 
 # Global list of ACL rules.
 acl_rules = []
 acl_rules_lock = threading.Lock()
+
+# Stores last seen time and status for the interfaces
+interface_status = {
+    PORT1: {"last_seen": time.time(), "status": "up"},
+    PORT2: {"last_seen": time.time(), "status": "up"}
+    }
+interface_status_lock = threading.Lock()
+INTERFACE_TIMEOUT = 10  # seconds
 
 def update_protocol_counters(packet, port_name, direction):
     if packet.haslayer(Ether):
@@ -53,20 +57,14 @@ def update_protocol_counters(packet, port_name, direction):
             stats[port_name][direction]["UDP"] += 1
 
 def acl_check(packet, direction, port_label):
-    """
-    Evaluate ACL rules sequentially; the first matching rule determines if the packet is permitted.
-    """
     with acl_rules_lock:
         for rule in acl_rules:
-            # Check rule direction (can be "in", "out", or "all")
             rule_direction = rule.get("direction", "all")
             if rule_direction != "all" and rule_direction != direction:
                 continue
-            # Check rule port (can be "port1", "port2", or "all")
             rule_port = rule.get("port", "all")
             if rule_port != "all" and rule_port != port_label:
                 continue
-            # Optional conditions:
             if "src_mac" in rule:
                 if not packet.haslayer(Ether) or packet[Ether].src.lower() != rule["src_mac"].lower():
                     continue
@@ -102,7 +100,6 @@ def acl_check(packet, direction, port_label):
                     continue
                 if int(packet[ICMP].type) != int(rule["icmp_type"]):
                     continue
-            # First matching rule decides:
             if rule.get("action", "permit") == "deny":
                 return False
             elif rule.get("action", "permit") == "permit":
@@ -128,19 +125,21 @@ def process_packet(packet, in_port):
 
     src_mac = packet[Ether].src
     dst_mac = packet[Ether].dst
-    # Update MAC table with current time.
     with mac_table_lock:
         mac_table[src_mac] = {"port": in_port, "timestamp": time.time()}
 
+    # --- Update interface status for the incoming port ---
+    with interface_status_lock:
+        interface_status[in_port]["last_seen"] = time.time()
+        interface_status[in_port]["status"] = "up"
+
     port_label_in = "port1" if in_port == PORT1 else "port2"
-    # Check ACL for inbound traffic.
     if not acl_check(packet, "in", port_label_in):
         return
 
     with stats_lock:
         update_protocol_counters(packet, port_label_in, "in")
 
-    # Determine output ports.
     out_ports = []
     if dst_mac.lower() == "ff:ff:ff:ff:ff:ff":
         out_ports = [port for port in [PORT1, PORT2] if port != in_port]
@@ -155,9 +154,13 @@ def process_packet(packet, in_port):
             else:
                 out_ports = [port for port in [PORT1, PORT2] if port != in_port]
 
-    # Check ACL for outbound traffic.
     for port in out_ports:
         port_label_out = "port1" if port == PORT1 else "port2"
+        # Before sending, check if the out_port is marked as "up"
+        with interface_status_lock:
+            if interface_status.get(port, {}).get("status") != "up":
+                # Skip sending on an interface that's considered down.
+                continue
         if not acl_check(packet, "out", port_label_out):
             continue
         sendp(packet, iface=port, verbose=False)
@@ -171,7 +174,6 @@ def cleanup_duplicate_table():
             duplicate_table.clear()
 
 def mac_table_aging():
-    """Remove MAC table entries that have been inactive for more than 30 seconds."""
     while True:
         time.sleep(1)
         now = time.time()
@@ -180,10 +182,21 @@ def mac_table_aging():
             for mac in to_delete:
                 del mac_table[mac]
 
+def monitor_interfaces():
+    while True:
+        time.sleep(1)
+        now = time.time()
+        with interface_status_lock:
+            for iface, info in interface_status.items():
+                if now - info["last_seen"] > INTERFACE_TIMEOUT:
+                    if info["status"] != "down":
+                        info["status"] = "down"
+                        print(f"Interface {iface} marked as down due to inactivity.")
+                        
 def sniff_port(port):
     sniff(iface=port, prn=lambda pkt: process_packet(pkt, port), store=False, promisc=True)
 
-# GUI class.
+# GUI class
 class SwitchGUI(tk.Frame):
     def __init__(self, master=None):
         super().__init__(master)
@@ -194,7 +207,6 @@ class SwitchGUI(tk.Frame):
         self.update_acl_display()
 
     def create_widgets(self):
-        # Create three frames: Stats, MAC Table, and ACL Rules.
         self.stats_frame = tk.Frame(self)
         self.stats_frame.grid(row=0, column=0, padx=10, pady=10)
         
@@ -204,19 +216,16 @@ class SwitchGUI(tk.Frame):
         self.acl_frame = tk.Frame(self)
         self.acl_frame.grid(row=0, column=2, padx=10, pady=10)
         
-        # Statistics widget.
         self.stats_text = tk.Text(self.stats_frame, width=60, height=16)
         self.stats_text.pack()
         self.reset_button = tk.Button(self.stats_frame, text="Reset Statistics", command=self.reset_stats)
         self.reset_button.pack(pady=5)
         
-        # MAC table widget.
         self.mac_table_text = tk.Text(self.mac_table_frame, width=40, height=16)
         self.mac_table_text.pack()
         self.clear_mac_button = tk.Button(self.mac_table_frame, text="Clear MAC Table", command=self.clear_mac_table)
         self.clear_mac_button.pack(pady=5)
         
-        # ACL rules widget.
         self.acl_listbox = tk.Listbox(self.acl_frame, width=60, height=16)
         self.acl_listbox.pack()
         self.acl_add_button = tk.Button(self.acl_frame, text="Add ACL Rule", command=self.add_acl_rule)
@@ -232,7 +241,6 @@ class SwitchGUI(tk.Frame):
             p1_out = stats["port1"]["out"]
             p2_in = stats["port2"]["in"]
             p2_out = stats["port2"]["out"]
-
             display_text = (
                 "======= PORT 1 IN =======\n"
                 f"Ethernet: {p1_in['Ethernet']}   ARP: {p1_in['ARP']}   IP: {p1_in['IP']}\n"
@@ -256,8 +264,7 @@ class SwitchGUI(tk.Frame):
         mac_display = "Learned MAC Addresses:\n\n"
         with mac_table_lock:
             for mac, info in mac_table.items():
-                # Optionally, format the timestamp as needed.
-                mac_display += f"{mac} : {info['port']} (last seen: {int(time.time() - info['timestamp'])}s ago)\n"
+                mac_display += f"{mac} : {info['port']} (last seen: {int(time.time()-info['timestamp'])}s ago)\n"
         self.mac_table_text.delete("1.0", tk.END)
         self.mac_table_text.insert(tk.END, mac_display)
         self.after(500, self.update_mac_table_display)
@@ -316,50 +323,39 @@ class SwitchGUI(tk.Frame):
 
         add_window = tk.Toplevel(self)
         add_window.title("Add ACL Rule")
-
         tk.Label(add_window, text="Action:").grid(row=0, column=0)
         action_var = tk.StringVar(value="permit")
         action_menu = tk.OptionMenu(add_window, action_var, "permit", "deny")
         action_menu.grid(row=0, column=1)
-
         tk.Label(add_window, text="Direction:").grid(row=1, column=0)
         direction_var = tk.StringVar(value="in")
         direction_menu = tk.OptionMenu(add_window, direction_var, "in", "out")
         direction_menu.grid(row=1, column=1)
-
         tk.Label(add_window, text="Port:").grid(row=2, column=0)
         port_var = tk.StringVar(value="all")
         port_menu = tk.OptionMenu(add_window, port_var, "all", "port1", "port2")
         port_menu.grid(row=2, column=1)
-
         tk.Label(add_window, text="Source MAC (optional):").grid(row=3, column=0)
         src_mac_entry = tk.Entry(add_window)
         src_mac_entry.grid(row=3, column=1)
-
         tk.Label(add_window, text="Destination MAC (optional):").grid(row=4, column=0)
         dst_mac_entry = tk.Entry(add_window)
         dst_mac_entry.grid(row=4, column=1)
-
         tk.Label(add_window, text="Source IP (optional):").grid(row=5, column=0)
         src_ip_entry = tk.Entry(add_window)
         src_ip_entry.grid(row=5, column=1)
-
         tk.Label(add_window, text="Destination IP (optional):").grid(row=6, column=0)
         dst_ip_entry = tk.Entry(add_window)
         dst_ip_entry.grid(row=6, column=1)
-
         tk.Label(add_window, text="Source Port (optional):").grid(row=7, column=0)
         src_port_entry = tk.Entry(add_window)
         src_port_entry.grid(row=7, column=1)
-
         tk.Label(add_window, text="Destination Port (optional):").grid(row=8, column=0)
         dst_port_entry = tk.Entry(add_window)
         dst_port_entry.grid(row=8, column=1)
-
         tk.Label(add_window, text="ICMP Type (optional):").grid(row=9, column=0)
         icmp_type_entry = tk.Entry(add_window)
         icmp_type_entry.grid(row=9, column=1)
-
         submit_button = tk.Button(add_window, text="Add Rule", command=submit_rule)
         submit_button.grid(row=10, column=0, columnspan=2)
 
@@ -373,19 +369,20 @@ class SwitchGUI(tk.Frame):
             self.update_acl_display()
 
 def main():
-    # Start sniffing on both ports.
     t1 = threading.Thread(target=sniff_port, args=(PORT1,), daemon=True)
     t2 = threading.Thread(target=sniff_port, args=(PORT2,), daemon=True)
     t1.start()
     t2.start()
 
-    # Start duplicate table cleanup thread.
     cleanup_thread = threading.Thread(target=cleanup_duplicate_table, daemon=True)
     cleanup_thread.start()
 
-    # Start MAC table aging thread.
     aging_thread = threading.Thread(target=mac_table_aging, daemon=True)
     aging_thread.start()
+
+    interface_monitor_thread = threading.Thread(target=monitor_interfaces, daemon=True)
+    interface_monitor_thread.start()
+
 
     root = tk.Tk()
     root.title("Switch Statistics, MAC Table and ACL Rules")
