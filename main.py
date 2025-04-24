@@ -1,7 +1,37 @@
 import tkinter as tk
 import threading
 import time
+import socket
 from scapy.all import sniff, sendp, Ether, ARP, IP, TCP, UDP, ICMP
+
+
+SYSLOG_SERVER_IP = "172.16.0.3"
+SYSLOG_SOURCE_IP = "172.16.0.10"
+SYSLOG_ENABLED   = False
+
+def send_syslog(msg, sev="info"):
+    if not SYSLOG_ENABLED:
+        return
+    ts = time.strftime("%b %d %H:%M:%S", time.localtime())
+    host = socket.gethostname()
+    payload = f"{ts} {host} {sev.upper()}: {msg}"
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind((SYSLOG_SOURCE_IP, 0))
+        s.sendto(payload.encode(), (SYSLOG_SERVER_IP, 514))
+        s.close()
+    except Exception as e:
+        print("Syslog error:", e)
+
+def start_syslog():
+    global SYSLOG_ENABLED
+    SYSLOG_ENABLED = True
+    send_syslog("Syslog started", "info")
+
+def stop_syslog():
+    global SYSLOG_ENABLED
+    send_syslog("Syslog stopped", "info")
+    SYSLOG_ENABLED = False
 
 # Select interface
 PORT1 = "en8"
@@ -20,22 +50,19 @@ stats = {
 }
 stats_lock = threading.Lock()
 
-# Duplicate table to track packet hashes.
 duplicate_table = set()
 duplicate_table_lock = threading.Lock()
 
 mac_table = {}
 mac_table_lock = threading.Lock()
 
-# Global list of ACL rules.
 acl_rules = []
 acl_rules_lock = threading.Lock()
 
-# Stores last seen time and status for the interfaces
 interface_status = {
     PORT1: {"last_seen": time.time(), "status": "up"},
     PORT2: {"last_seen": time.time(), "status": "up"}
-    }
+}
 interface_status_lock = threading.Lock()
 INTERFACE_TIMEOUT = 10  # seconds
 
@@ -101,6 +128,7 @@ def acl_check(packet, direction, port_label):
                 if int(packet[ICMP].type) != int(rule["icmp_type"]):
                     continue
             if rule.get("action", "permit") == "deny":
+                send_syslog(f"Packet from {packet[Ether].src} to {packet[Ether].dst} denied by ACL: {rule}", "warning")
                 return False
             elif rule.get("action", "permit") == "permit":
                 return True
@@ -109,29 +137,36 @@ def acl_check(packet, direction, port_label):
 def process_packet(packet, in_port):
     if not packet.haslayer(Ether):
         return
-
     try:
-        packet_bytes = bytes(packet)
-        packet_hash = hash(packet_bytes)
-    except Exception as e:
-        print("Error computing packet hash:", e)
+        packet_hash = hash(bytes(packet))
+    except Exception:
         return
-
     with duplicate_table_lock:
         if packet_hash in duplicate_table:
             return
-        else:
-            duplicate_table.add(packet_hash)
+        duplicate_table.add(packet_hash)
 
     src_mac = packet[Ether].src
     dst_mac = packet[Ether].dst
-    with mac_table_lock:
-        mac_table[src_mac] = {"port": in_port, "timestamp": time.time()}
 
-    # --- Update interface status for the incoming port ---
+    # MAC learn / move / timestamp
+    with mac_table_lock:
+        prev_port = mac_table.get(src_mac, {}).get("port")
+        moved = prev_port and prev_port != in_port
+        new   = prev_port is None
+        mac_table[src_mac] = {"port": in_port, "timestamp": time.time()}
+    if moved:
+        send_syslog(f"MAC {src_mac} moved from {prev_port} to {in_port}", "warning")
+    elif new:
+        send_syslog(f"MAC {src_mac} learned on {in_port}", "info")
+
+    # interface status update
     with interface_status_lock:
+        was_down = interface_status[in_port]["status"] == "down"
         interface_status[in_port]["last_seen"] = time.time()
         interface_status[in_port]["status"] = "up"
+    if was_down:
+        send_syslog(f"Interface {in_port} is up", "info")
 
     port_label_in = "port1" if in_port == PORT1 else "port2"
     if not acl_check(packet, "in", port_label_in):
@@ -142,25 +177,21 @@ def process_packet(packet, in_port):
 
     out_ports = []
     if dst_mac.lower() == "ff:ff:ff:ff:ff:ff":
-        out_ports = [port for port in [PORT1, PORT2] if port != in_port]
+        out_ports = [p for p in (PORT1, PORT2) if p != in_port]
     else:
         with mac_table_lock:
             if dst_mac in mac_table:
                 learned_port = mac_table[dst_mac]["port"]
                 if learned_port != in_port:
                     out_ports = [learned_port]
-                else:
-                    out_ports = []
             else:
-                out_ports = [port for port in [PORT1, PORT2] if port != in_port]
+                out_ports = [p for p in (PORT1, PORT2) if p != in_port]
 
     for port in out_ports:
-        port_label_out = "port1" if port == PORT1 else "port2"
-        # Before sending, check if the out_port is marked as "up"
         with interface_status_lock:
             if interface_status.get(port, {}).get("status") != "up":
-                # Skip sending on an interface that's considered down.
                 continue
+        port_label_out = "port1" if port == PORT1 else "port2"
         if not acl_check(packet, "out", port_label_out):
             continue
         sendp(packet, iface=port, verbose=False)
@@ -178,8 +209,7 @@ def mac_table_aging():
         time.sleep(1)
         now = time.time()
         with mac_table_lock:
-            to_delete = [mac for mac, info in mac_table.items() if now - info["timestamp"] > 30]
-            for mac in to_delete:
+            for mac in [m for m,i in mac_table.items() if now - i["timestamp"] > 30]:
                 del mac_table[mac]
 
 def monitor_interfaces():
@@ -188,15 +218,14 @@ def monitor_interfaces():
         now = time.time()
         with interface_status_lock:
             for iface, info in interface_status.items():
-                if now - info["last_seen"] > INTERFACE_TIMEOUT:
-                    if info["status"] != "down":
-                        info["status"] = "down"
-                        print(f"Interface {iface} marked as down due to inactivity.")
-                        
-def sniff_port(port):
-    sniff(iface=port, prn=lambda pkt: process_packet(pkt, port), store=False, promisc=True)
+                if now - info["last_seen"] > INTERFACE_TIMEOUT and info["status"] != "down":
+                    info["status"] = "down"
+                    print(f"Interface {iface} marked as down due to inactivity.")
+                    send_syslog(f"Interface {iface} down (inactivity)", "critical")
 
-# GUI class
+def sniff_port(port):
+    sniff(iface=port, prn=lambda p: process_packet(p, port), store=False, promisc=True)
+
 class SwitchGUI(tk.Frame):
     def __init__(self, master=None):
         super().__init__(master)
@@ -209,23 +238,21 @@ class SwitchGUI(tk.Frame):
     def create_widgets(self):
         self.stats_frame = tk.Frame(self)
         self.stats_frame.grid(row=0, column=0, padx=10, pady=10)
-        
         self.mac_table_frame = tk.Frame(self)
         self.mac_table_frame.grid(row=0, column=1, padx=10, pady=10)
-        
         self.acl_frame = tk.Frame(self)
         self.acl_frame.grid(row=0, column=2, padx=10, pady=10)
-        
+
         self.stats_text = tk.Text(self.stats_frame, width=60, height=16)
         self.stats_text.pack()
         self.reset_button = tk.Button(self.stats_frame, text="Reset Statistics", command=self.reset_stats)
         self.reset_button.pack(pady=5)
-        
+
         self.mac_table_text = tk.Text(self.mac_table_frame, width=40, height=16)
         self.mac_table_text.pack()
         self.clear_mac_button = tk.Button(self.mac_table_frame, text="Clear MAC Table", command=self.clear_mac_table)
         self.clear_mac_button.pack(pady=5)
-        
+
         self.acl_listbox = tk.Listbox(self.acl_frame, width=60, height=16)
         self.acl_listbox.pack()
         self.acl_add_button = tk.Button(self.acl_frame, text="Add ACL Rule", command=self.add_acl_rule)
@@ -233,15 +260,31 @@ class SwitchGUI(tk.Frame):
         self.acl_delete_button = tk.Button(self.acl_frame, text="Delete Selected ACL Rule", command=self.delete_acl_rule)
         self.acl_delete_button.pack(pady=5)
 
+        self.syslog_frame = tk.Frame(self)
+        self.syslog_frame.grid(row=1, column=0, columnspan=3, pady=10)
+        tk.Label(self.syslog_frame, text="Syslog source IP:").grid(row=0, column=0)
+        self.src_ip_entry = tk.Entry(self.syslog_frame, width=15)
+        self.src_ip_entry.insert(0, SYSLOG_SOURCE_IP)
+        self.src_ip_entry.grid(row=0, column=1)
+        tk.Label(self.syslog_frame, text="Server IP:").grid(row=0, column=2)
+        self.dst_ip_entry = tk.Entry(self.syslog_frame, width=15)
+        self.dst_ip_entry.insert(0, SYSLOG_SERVER_IP)
+        self.dst_ip_entry.grid(row=0, column=3)
+        tk.Button(self.syslog_frame, text="Apply", command=self.apply_syslog_conf).grid(row=0, column=4, padx=5)
+        tk.Button(self.syslog_frame, text="Start", command=start_syslog).grid(row=0, column=5, padx=3)
+        tk.Button(self.syslog_frame, text="Stop", command=stop_syslog).grid(row=0, column=6, padx=3)
+
+    def apply_syslog_conf(self):
+        global SYSLOG_SOURCE_IP, SYSLOG_SERVER_IP
+        SYSLOG_SOURCE_IP = self.src_ip_entry.get().strip()
+        SYSLOG_SERVER_IP = self.dst_ip_entry.get().strip()
+
     def update_stats_display(self):
-        current_scroll = self.stats_text.yview()
-        display_text = ""
+        cur = self.stats_text.yview()
         with stats_lock:
-            p1_in = stats["port1"]["in"]
-            p1_out = stats["port1"]["out"]
-            p2_in = stats["port2"]["in"]
-            p2_out = stats["port2"]["out"]
-            display_text = (
+            p1_in, p1_out = stats["port1"]["in"], stats["port1"]["out"]
+            p2_in, p2_out = stats["port2"]["in"], stats["port2"]["out"]
+            txt = (
                 "======= PORT 1 IN =======\n"
                 f"Ethernet: {p1_in['Ethernet']}   ARP: {p1_in['ARP']}   IP: {p1_in['IP']}\n"
                 f"TCP: {p1_in['TCP']}   UDP: {p1_in['UDP']}   ICMP: {p1_in['ICMP']}   HTTP: {p1_in['HTTP']}\n\n"
@@ -256,138 +299,83 @@ class SwitchGUI(tk.Frame):
                 f"TCP: {p2_out['TCP']}   UDP: {p2_out['UDP']}   ICMP: {p2_out['ICMP']}   HTTP: {p2_out['HTTP']}\n"
             )
         self.stats_text.delete("1.0", tk.END)
-        self.stats_text.insert(tk.END, display_text)
-        self.stats_text.yview_moveto(current_scroll[0])
+        self.stats_text.insert(tk.END, txt)
+        self.stats_text.yview_moveto(cur[0])
         self.after(500, self.update_stats_display)
 
     def update_mac_table_display(self):
-        mac_display = "Learned MAC Addresses:\n\n"
         with mac_table_lock:
-            for mac, info in mac_table.items():
-                mac_display += f"{mac} : {info['port']} (last seen: {int(time.time()-info['timestamp'])}s ago)\n"
+            lines = [f"{mac} : {info['port']} ({int(time.time()-info['timestamp'])}s ago)" for mac,info in mac_table.items()]
         self.mac_table_text.delete("1.0", tk.END)
-        self.mac_table_text.insert(tk.END, mac_display)
+        self.mac_table_text.insert(tk.END, "Learned MAC Addresses:\n\n"+"\n".join(lines))
         self.after(500, self.update_mac_table_display)
 
     def update_acl_display(self):
         self.acl_listbox.delete(0, tk.END)
         with acl_rules_lock:
             for idx, rule in enumerate(acl_rules):
-                rule_text = f"{idx}: {rule}"
-                self.acl_listbox.insert(tk.END, rule_text)
+                self.acl_listbox.insert(tk.END, f"{idx}: {rule}")
 
     def reset_stats(self):
         with stats_lock:
-            for direction in ("in", "out"):
-                for protocol in stats["port1"][direction]:
-                    stats["port1"][direction][protocol] = 0
-                for protocol in stats["port2"][direction]:
-                    stats["port2"][direction][protocol] = 0
+            for d in ("in","out"):
+                for p in stats["port1"][d]:
+                    stats["port1"][d][p] = 0
+                    stats["port2"][d][p] = 0
 
     def clear_mac_table(self):
         with mac_table_lock:
             mac_table.clear()
 
     def add_acl_rule(self):
-        def submit_rule():
-            rule = {}
-            rule["action"] = action_var.get()
-            rule["direction"] = direction_var.get()
-            rule["port"] = port_var.get()
-            src_mac_val = src_mac_entry.get().strip()
-            if src_mac_val:
-                rule["src_mac"] = src_mac_val
-            dst_mac_val = dst_mac_entry.get().strip()
-            if dst_mac_val:
-                rule["dst_mac"] = dst_mac_val
-            src_ip_val = src_ip_entry.get().strip()
-            if src_ip_val:
-                rule["src_ip"] = src_ip_val
-            dst_ip_val = dst_ip_entry.get().strip()
-            if dst_ip_val:
-                rule["dst_ip"] = dst_ip_val
-            src_port_val = src_port_entry.get().strip()
-            if src_port_val:
-                rule["src_port"] = src_port_val
-            dst_port_val = dst_port_entry.get().strip()
-            if dst_port_val:
-                rule["dst_port"] = dst_port_val
-            icmp_type_val = icmp_type_entry.get().strip()
-            if icmp_type_val:
-                rule["icmp_type"] = icmp_type_val
-
+        def submit():
+            rule = {"action": action.get(), "direction": direction.get(), "port": port.get()}
+            if src_mac.get().strip(): rule["src_mac"]=src_mac.get().strip()
+            if dst_mac.get().strip(): rule["dst_mac"]=dst_mac.get().strip()
+            if src_ip.get().strip():  rule["src_ip"]=src_ip.get().strip()
+            if dst_ip.get().strip():  rule["dst_ip"]=dst_ip.get().strip()
+            if src_port.get().strip():rule["src_port"]=src_port.get().strip()
+            if dst_port.get().strip():rule["dst_port"]=dst_port.get().strip()
+            if icmp_type.get().strip():rule["icmp_type"]=icmp_type.get().strip()
             with acl_rules_lock:
                 acl_rules.append(rule)
+            send_syslog(f"ACL rule added: {rule}", "info")
             self.update_acl_display()
-            add_window.destroy()
+            w.destroy()
 
-        add_window = tk.Toplevel(self)
-        add_window.title("Add ACL Rule")
-        tk.Label(add_window, text="Action:").grid(row=0, column=0)
-        action_var = tk.StringVar(value="permit")
-        action_menu = tk.OptionMenu(add_window, action_var, "permit", "deny")
-        action_menu.grid(row=0, column=1)
-        tk.Label(add_window, text="Direction:").grid(row=1, column=0)
-        direction_var = tk.StringVar(value="in")
-        direction_menu = tk.OptionMenu(add_window, direction_var, "in", "out")
-        direction_menu.grid(row=1, column=1)
-        tk.Label(add_window, text="Port:").grid(row=2, column=0)
-        port_var = tk.StringVar(value="all")
-        port_menu = tk.OptionMenu(add_window, port_var, "all", "port1", "port2")
-        port_menu.grid(row=2, column=1)
-        tk.Label(add_window, text="Source MAC (optional):").grid(row=3, column=0)
-        src_mac_entry = tk.Entry(add_window)
-        src_mac_entry.grid(row=3, column=1)
-        tk.Label(add_window, text="Destination MAC (optional):").grid(row=4, column=0)
-        dst_mac_entry = tk.Entry(add_window)
-        dst_mac_entry.grid(row=4, column=1)
-        tk.Label(add_window, text="Source IP (optional):").grid(row=5, column=0)
-        src_ip_entry = tk.Entry(add_window)
-        src_ip_entry.grid(row=5, column=1)
-        tk.Label(add_window, text="Destination IP (optional):").grid(row=6, column=0)
-        dst_ip_entry = tk.Entry(add_window)
-        dst_ip_entry.grid(row=6, column=1)
-        tk.Label(add_window, text="Source Port (optional):").grid(row=7, column=0)
-        src_port_entry = tk.Entry(add_window)
-        src_port_entry.grid(row=7, column=1)
-        tk.Label(add_window, text="Destination Port (optional):").grid(row=8, column=0)
-        dst_port_entry = tk.Entry(add_window)
-        dst_port_entry.grid(row=8, column=1)
-        tk.Label(add_window, text="ICMP Type (optional):").grid(row=9, column=0)
-        icmp_type_entry = tk.Entry(add_window)
-        icmp_type_entry.grid(row=9, column=1)
-        submit_button = tk.Button(add_window, text="Add Rule", command=submit_rule)
-        submit_button.grid(row=10, column=0, columnspan=2)
+        w = tk.Toplevel(self); w.title("Add ACL Rule")
+        action, direction, port = tk.StringVar(w,"permit"), tk.StringVar(w,"in"), tk.StringVar(w,"all")
+        for idx,(lab,var,opts) in enumerate([("Action",action,["permit","deny"]),
+                                             ("Direction",direction,["in","out"]),
+                                             ("Port",port,["all","port1","port2"])]):
+            tk.Label(w,text=f"{lab}:").grid(row=idx,column=0); tk.OptionMenu(w,var,*opts).grid(row=idx,column=1)
+        labels = ["Source MAC","Destination MAC","Source IP","Destination IP","Source Port","Destination Port","ICMP Type"]
+        src_mac,dst_mac,src_ip,dst_ip,src_port,dst_port,icmp_type=[tk.StringVar(w) for _ in range(7)]
+        evars = [src_mac,dst_mac,src_ip,dst_ip,src_port,dst_port,icmp_type]
+        for i,l in enumerate(labels,3):
+            tk.Label(w,text=f"{l} (optional):").grid(row=i,column=0); tk.Entry(w,textvariable=evars[i-3]).grid(row=i,column=1)
+        tk.Button(w,text="Add Rule",command=submit).grid(row=10,column=0,columnspan=2)
 
     def delete_acl_rule(self):
-        selection = self.acl_listbox.curselection()
-        if selection:
-            idx = int(selection[0])
+        sel=self.acl_listbox.curselection()
+        if sel:
+            idx=int(sel[0])
             with acl_rules_lock:
-                if idx < len(acl_rules):
+                if idx<len(acl_rules):
+                    rule=acl_rules[idx]
                     del acl_rules[idx]
+            send_syslog(f"ACL rule deleted: {rule}", "warning")
             self.update_acl_display()
 
 def main():
-    t1 = threading.Thread(target=sniff_port, args=(PORT1,), daemon=True)
-    t2 = threading.Thread(target=sniff_port, args=(PORT2,), daemon=True)
-    t1.start()
-    t2.start()
+    threading.Thread(target=sniff_port,args=(PORT1,),daemon=True).start()
+    threading.Thread(target=sniff_port,args=(PORT2,),daemon=True).start()
+    threading.Thread(target=cleanup_duplicate_table,daemon=True).start()
+    threading.Thread(target=mac_table_aging,daemon=True).start()
+    threading.Thread(target=monitor_interfaces,daemon=True).start()
 
-    cleanup_thread = threading.Thread(target=cleanup_duplicate_table, daemon=True)
-    cleanup_thread.start()
+    root=tk.Tk(); root.title("Switch Statistics, MAC Table and ACL Rules")
+    SwitchGUI(master=root); root.mainloop()
 
-    aging_thread = threading.Thread(target=mac_table_aging, daemon=True)
-    aging_thread.start()
-
-    interface_monitor_thread = threading.Thread(target=monitor_interfaces, daemon=True)
-    interface_monitor_thread.start()
-
-
-    root = tk.Tk()
-    root.title("Switch Statistics, MAC Table and ACL Rules")
-    app = SwitchGUI(master=root)
-    root.mainloop()
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
