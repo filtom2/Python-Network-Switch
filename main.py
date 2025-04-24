@@ -25,11 +25,15 @@ def send_syslog(msg, sev="info"):
 
 def start_syslog():
     global SYSLOG_ENABLED
+    if SYSLOG_ENABLED:
+        return 
     SYSLOG_ENABLED = True
     send_syslog("Syslog started", "info")
 
 def stop_syslog():
     global SYSLOG_ENABLED
+    if not SYSLOG_ENABLED:
+        return 
     send_syslog("Syslog stopped", "info")
     SYSLOG_ENABLED = False
 
