@@ -10,6 +10,7 @@ SYSLOG_SOURCE_IP = "172.16.0.10"
 SYSLOG_ENABLED   = False
 SEVERITY = {"info": 6, "warning": 4, "critical": 2}
 FACILITY = 23
+MAC_TABLE_TIMEOUT = 30  # seconds to remember learned MAC addresses
 
 def send_syslog(msg, sev="info"):
     if not SYSLOG_ENABLED:
@@ -218,7 +219,7 @@ def mac_table_aging():
         time.sleep(1)
         now = time.time()
         with mac_table_lock:
-            for mac in [m for m,i in mac_table.items() if now - i["timestamp"] > 30]:
+            for mac in [m for m,i in mac_table.items() if now - i["timestamp"] > MAC_TABLE_TIMEOUT]:
                 del mac_table[mac]
 
 def monitor_interfaces():
@@ -279,14 +280,22 @@ class SwitchGUI(tk.Frame):
         self.dst_ip_entry = tk.Entry(self.syslog_frame, width=15)
         self.dst_ip_entry.insert(0, SYSLOG_SERVER_IP)
         self.dst_ip_entry.grid(row=0, column=3)
+        tk.Label(self.syslog_frame, text="MAC Aging Timeout (s):").grid(row=1, column=0)
+        self.mac_timeout_entry = tk.Entry(self.syslog_frame, width=5)
+        self.mac_timeout_entry.insert(0, str(MAC_TABLE_TIMEOUT))
+        self.mac_timeout_entry.grid(row=1, column=1)
         tk.Button(self.syslog_frame, text="Apply", command=self.apply_syslog_conf).grid(row=0, column=4, padx=5)
         tk.Button(self.syslog_frame, text="Start", command=start_syslog).grid(row=0, column=5, padx=3)
         tk.Button(self.syslog_frame, text="Stop", command=stop_syslog).grid(row=0, column=6, padx=3)
 
     def apply_syslog_conf(self):
-        global SYSLOG_SOURCE_IP, SYSLOG_SERVER_IP
+        global SYSLOG_SOURCE_IP, SYSLOG_SERVER_IP, MAC_TABLE_TIMEOUT
         SYSLOG_SOURCE_IP = self.src_ip_entry.get().strip()
         SYSLOG_SERVER_IP = self.dst_ip_entry.get().strip()
+        try:
+            MAC_TABLE_TIMEOUT = int(self.mac_timeout_entry.get().strip())
+        except ValueError:
+            pass
 
     def update_stats_display(self):
         cur = self.stats_text.yview()
