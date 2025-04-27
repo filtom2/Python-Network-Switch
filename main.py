@@ -8,13 +8,13 @@ from scapy.all import sniff, sendp, Ether, ARP, IP, TCP, UDP, ICMP
 SYSLOG_SERVER_IP = "172.16.0.3"
 SYSLOG_SOURCE_IP = "172.16.0.10"
 SYSLOG_ENABLED   = False
-_SEVERITY = {"info": 6, "warning": 4, "critical": 2}
-_FACILITY = 23
+SEVERITY = {"info": 6, "warning": 4, "critical": 2}
+FACILITY = 23
 
 def send_syslog(msg, sev="info"):
     if not SYSLOG_ENABLED:
         return
-    pri = _FACILITY * 8 + _SEVERITY.get(sev, 6)
+    pri = FACILITY * 8 + SEVERITY.get(sev, 6)
     ts = time.strftime("%b %d %H:%M:%S", time.localtime())
     host = socket.gethostname()
     payload = f"<{pri}>{ts} {host} {msg}"
@@ -71,7 +71,7 @@ interface_status = {
     PORT2: {"last_seen": time.time(), "status": "up"}
 }
 interface_status_lock = threading.Lock()
-INTERFACE_TIMEOUT = 10  # seconds
+INTERFACE_TIMEOUT = 10 # seconds
 
 def update_protocol_counters(packet, port_name, direction):
     if packet.haslayer(Ether):
@@ -162,6 +162,7 @@ def process_packet(packet, in_port):
         moved = prev_port and prev_port != in_port
         new   = prev_port is None
         mac_table[src_mac] = {"port": in_port, "timestamp": time.time()}
+    # Handle MAC movement or new learning of an address
     if moved:
         send_syslog(f"MAC {src_mac} moved from {prev_port} to {in_port}", "warning")
     elif new:
@@ -182,6 +183,7 @@ def process_packet(packet, in_port):
     with stats_lock:
         update_protocol_counters(packet, port_label_in, "in")
 
+    # Determine outgoing ports from destination MAC
     out_ports = []
     if dst_mac.lower() == "ff:ff:ff:ff:ff:ff":
         out_ports = [p for p in (PORT1, PORT2) if p != in_port]
@@ -350,17 +352,20 @@ class SwitchGUI(tk.Frame):
             self.update_acl_display()
             w.destroy()
 
-        w = tk.Toplevel(self); w.title("Add ACL Rule")
+        w = tk.Toplevel(self)
+        w.title("Add ACL Rule")
         action, direction, port = tk.StringVar(w,"permit"), tk.StringVar(w,"in"), tk.StringVar(w,"all")
         for idx,(lab,var,opts) in enumerate([("Action",action,["permit","deny"]),
                                              ("Direction",direction,["in","out"]),
                                              ("Port",port,["all","port1","port2"])]):
-            tk.Label(w,text=f"{lab}:").grid(row=idx,column=0); tk.OptionMenu(w,var,*opts).grid(row=idx,column=1)
-        labels = ["Source MAC","Destination MAC","Source IP","Destination IP","Source Port","Destination Port","ICMP Type"]
+            tk.Label(w,text=f"{lab}:").grid(row=idx,column=0)
+            tk.OptionMenu(w,var,*opts).grid(row=idx,column=1)
+        labels = ["Source MAC","Destination MAC","Source IP","Destination IP","Source Port","Destination Port","ICMP Type (e.g. 8, 0, ...)"]
         src_mac,dst_mac,src_ip,dst_ip,src_port,dst_port,icmp_type=[tk.StringVar(w) for _ in range(7)]
         evars = [src_mac,dst_mac,src_ip,dst_ip,src_port,dst_port,icmp_type]
-        for i,l in enumerate(labels,3):
-            tk.Label(w,text=f"{l} (optional):").grid(row=i,column=0); tk.Entry(w,textvariable=evars[i-3]).grid(row=i,column=1)
+        for i, l in enumerate(labels, 3):
+            tk.Label(w, text=l).grid(row=i, column=0)
+            tk.Entry(w, textvariable=evars[i-3]).grid(row=i, column=1)
         tk.Button(w,text="Add Rule",command=submit).grid(row=10,column=0,columnspan=2)
 
     def delete_acl_rule(self):
@@ -381,8 +386,10 @@ def main():
     threading.Thread(target=mac_table_aging,daemon=True).start()
     threading.Thread(target=monitor_interfaces,daemon=True).start()
 
-    root=tk.Tk(); root.title("Switch Statistics, MAC Table and ACL Rules")
-    SwitchGUI(master=root); root.mainloop()
+    root=tk.Tk()
+    root.title("Switch Statistics, MAC Table and ACL Rules")
+    SwitchGUI(master=root)
+    root.mainloop()
 
 if __name__=="__main__":
     main()
